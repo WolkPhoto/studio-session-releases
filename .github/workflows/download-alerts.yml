@@ -5,6 +5,11 @@ on:
   schedule:
     - cron: '*/5 * * * *'
   workflow_dispatch:
+    inputs:
+      test_notification:
+        description: 'Send a test notification to iPhone'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -16,6 +21,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
+
     steps:
       - name: Check downloads and notify
         env:
@@ -23,120 +29,210 @@ jobs:
           PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
           PUSHOVER_API_TOKEN: ${{ secrets.PUSHOVER_API_TOKEN }}
           REPO: ${{ github.repository }}
+          TEST_NOTIFICATION: ${{ inputs.test_notification || 'false' }}
+
         run: |
           python3 - <<'PY'
-          import os, json, urllib.request, urllib.parse
+          import os
+          import json
+          import base64
+          import urllib.request
+          import urllib.parse
+          import urllib.error
           import subprocess
 
           repo = os.environ["REPO"]
           token = os.environ["GH_TOKEN"]
+
           headers = {
               "Authorization": f"Bearer {token}",
               "Accept": "application/vnd.github+json",
-              "User-Agent": "release-download-alerts"
+              "User-Agent": "studio-session-download-alerts"
           }
 
-          def request(url, data=None, headers_override=None):
+          def request(url, data=None, custom_headers=None):
               req = urllib.request.Request(
-                  url, data=data,
-                  headers=headers_override or headers
+                  url,
+                  data=data,
+                  headers=custom_headers if custom_headers is not None else headers
               )
-              with urllib.request.urlopen(req, timeout=30) as r:
-                  return json.load(r)
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      return json.load(r)
+              except urllib.error.HTTPError as e:
+                  print(f"HTTP {e.code} from {url.split('?')[0]}")
+                  if "pushover.net" in url:
+                      print("Pushover response:")
+                      print(e.read().decode(errors="replace"))
+                  raise
 
-          # Read all release assets
+          def notify(title, message):
+              user = os.environ.get("PUSHOVER_USER_KEY", "").strip()
+              app = os.environ.get("PUSHOVER_API_TOKEN", "").strip()
+
+              if not user or not app:
+                  raise RuntimeError(
+                      "Missing Pushover user key or API token"
+                  )
+
+              payload = urllib.parse.urlencode({
+                  "token": app,
+                  "user": user,
+                  "title": title,
+                  "message": message,
+                  "url": f"https://github.com/{repo}/releases"
+              }).encode()
+
+              result = request(
+                  "https://api.pushover.net/1/messages.json",
+                  payload,
+                  {"Content-Type": "application/x-www-form-urlencoded"}
+              )
+
+              if result.get("status") != 1:
+                  raise RuntimeError("Pushover did not confirm success")
+
+              print("Pushover notification sent successfully.")
+
+          # Optional manual notification test
+          if os.environ.get("TEST_NOTIFICATION", "").lower() == "true":
+              notify(
+                  "Studio Session Test",
+                  "GitHub download alerts are connected!"
+              )
+
+          # Fetch all releases and download counts
           current = {}
           page = 1
+
           while True:
               releases = request(
                   f"https://api.github.com/repos/{repo}/releases"
                   f"?per_page=100&page={page}"
               )
+
               for release in releases:
                   for asset in release.get("assets", []):
                       current[str(asset["id"])] = {
                           "name": asset["name"],
                           "count": asset["download_count"]
                       }
+
               if len(releases) < 100:
                   break
+
               page += 1
 
-          # Retrieve previous state from dedicated branch
+          print(f"Tracking {len(current)} release assets.")
+
+          # Load previous download counts
           state = {}
+          state_exists = False
+
           try:
-              url = (f"https://api.github.com/repos/{repo}"
-                     "/contents/download-counts.json"
-                     "?ref=download-alert-state")
-              import base64
-              response = request(url)
-              state = json.loads(base64.b64decode(
-                  response["content"]
-              ))
+              response = request(
+                  f"https://api.github.com/repos/{repo}"
+                  "/contents/download-counts.json"
+                  "?ref=download-alert-state"
+              )
+
+              state = json.loads(
+                  base64.b64decode(response["content"])
+              )
+              state_exists = True
+
           except urllib.error.HTTPError as e:
               if e.code != 404:
                   raise
+              print("No previous state found. Creating baseline.")
 
-          # First run establishes baseline
-          if state:
+          # Detect new downloads
+          alerts = []
+
+          if state_exists:
               for asset_id, asset in current.items():
                   previous = state.get(asset_id)
+
                   if previous is None:
                       continue
-                  delta = asset["count"] - previous
-                  if delta > 0:
-                      message = (
-                          f"{asset['name']}\n"
-                          f"New downloads: {delta}\n"
-                          f"Total: {asset['count']}"
-                      )
-                      payload = urllib.parse.urlencode({
-                          "token": os.environ["PUSHOVER_API_TOKEN"],
-                          "user": os.environ["PUSHOVER_USER_KEY"],
-                          "title": "Studio Session Download",
-                          "message": message,
-                          "url": f"https://github.com/{repo}/releases"
-                      }).encode()
-                      request(
-                          "https://api.pushover.net/1/messages.json",
-                          payload,
-                          {"Content-Type":
-                           "application/x-www-form-urlencoded"}
-                      )
-                      print(message)
 
-          # Save state in a dedicated orphan branch
+                  delta = asset["count"] - previous
+
+                  if delta > 0:
+                      alerts.append({
+                          "name": asset["name"],
+                          "delta": delta,
+                          "total": asset["count"]
+                      })
+
+          # Notify before advancing state
+          for alert in alerts:
+              message = (
+                  f"{alert['name']}\n"
+                  f"New downloads: {alert['delta']}\n"
+                  f"Total downloads: {alert['total']}"
+              )
+
+              notify("Studio Session Download", message)
+              print(message)
+
+          if not alerts:
+              print("No new downloads detected.")
+
+          # Skip writing if counts are unchanged
+          new_state = {
+              asset_id: asset["count"]
+              for asset_id, asset in current.items()
+          }
+
+          if state_exists and new_state == state:
+              print("Download counts unchanged.")
+              raise SystemExit(0)
+
+          # Save counts to dedicated state branch
           subprocess.run(
-              ["git", "init", "-q", "state"], check=True
+              ["git", "init", "-q", "state"],
+              check=True
           )
+
           os.chdir("state")
+
           subprocess.run(
               ["git", "config", "user.name", "github-actions"],
               check=True
           )
+
           subprocess.run(
-              ["git", "config", "user.email",
-               "github-actions@users.noreply.github.com"],
+              [
+                  "git", "config", "user.email",
+                  "github-actions@users.noreply.github.com"
+              ],
               check=True
           )
+
           with open("download-counts.json", "w") as f:
-              json.dump(
-                  {k: v["count"] for k, v in current.items()},
-                  f, indent=2
-              )
+              json.dump(new_state, f, indent=2)
+
           subprocess.run(["git", "add", "."], check=True)
+
           subprocess.run(
               ["git", "commit", "-qm", "Update download counts"],
               check=True
           )
+
           remote = (
               f"https://x-access-token:{token}"
               f"@github.com/{repo}.git"
           )
+
           subprocess.run(
-              ["git", "push", "--force", remote,
-               "HEAD:refs/heads/download-alert-state"],
+              [
+                  "git", "push", "--force",
+                  remote,
+                  "HEAD:refs/heads/download-alert-state"
+              ],
               check=True
           )
-          print("Download counts saved.")
+
+          print("Download counts saved successfully.")
           PY
